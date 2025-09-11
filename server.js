@@ -148,22 +148,14 @@ async function bcDataHandler(req, res) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// /api/sv/motor — join โดยอิงคีย์ No/Document_No (ไม่ใช้ branch)
+// /api/sv/motor — join โดยอิงคีย์ No/Document_No ตามที่กำหนด (ไม่ใช้ branch)
 async function svMotorHandler(req, res) {
   try {
     const nowYear = new Date().getFullYear();
     const q = req.query || {};
     const b = req.body || {};
+    const selectedYear = Number(q.year ?? b.year ?? nowYear);
 
-    // ——— helper: ให้ปีที่ valid เสมอ (default = ปีปัจจุบัน)
-    const resolveYear = (val) => {
-      const y = Number.parseInt(String(val ?? ""), 10);
-      return Number.isFinite(y) && y >= 2000 && y <= 2100 ? y : nowYear;
-    };
-
-    const selectedYear = resolveYear(q.year ?? b.year);
-
-    // สร้างช่วงวันแบบเต็มปีตาม selectedYear
     const startISO = `${selectedYear}-01-01T00:00:00.000Z`;
     const endISO = `${selectedYear}-12-31T23:59:59.999Z`;
 
@@ -177,33 +169,24 @@ async function svMotorHandler(req, res) {
       `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}` +
       `/ODataV4/Company('${company}')`;
 
-    // 1) หัวรายการจาก Service_Order_Excel — filter ด้วย datetimeoffset
+    // 1) หัวรายการจาก Service_Order_Excel (ใช้ No เป็นคีย์อ้างอิง, กรองปีด้วย Order_Date) — ดึงทุกหน้า
     const headerSelect = ['No', 'Order_Date', 'USVT_Job_Scope'].join(',');
-    const headerFilterRaw =
-      `(Order_Date ge datetimeoffset'${startISO}' and ` +
-      `Order_Date le datetimeoffset'${endISO}')`;
-
+    const headerFilter = `(Order_Date ge ${startISO} and Order_Date le ${endISO})`;
     const headerUrl =
-      `${base}/Service_Order_Excel?$select=${headerSelect}` +
-      `&$filter=${encodeURIComponent(headerFilterRaw)}` +
-      `&$orderby=Order_Date desc`;
+      `${base}/Service_Order_Excel?$select=${headerSelect}&$filter=${encodeURI(headerFilter)}&$top=500&$orderby=Order_Date desc`;
 
     const headers = await fetchAllOData(headerUrl, {
       Authorization: `Bearer ${token}`,
       Accept: 'application/json'
     });
-    if (!headers.length) {
-      // ส่งปีที่ใช้ไปด้วย เพื่อให้ฝั่ง BI รู้ว่า default ทำงานแล้ว
-      return res.json({ selected_year: selectedYear, rows: [] });
-    }
+    if (!headers.length) return res.json([]);
 
     const svList = headers.map(h => h.No).filter(Boolean);
     const chunks = chunkArray(svList, 30);
 
-    // 2) ServiceItemLines — join ด้วย Document_No
+    // 2) ServiceItemLines — ดึงทุกหน้า, join ด้วย Document_No
     let itemLines = [];
     for (const chunk of chunks) {
-      // สมมติ buildDocumentNoFilter คืนค่าเป็น "$filter=" + encodeURIComponent("(Document_No eq '...' or ...)")
       const filter = buildDocumentNoFilter(chunk);
       const url =
         `${base}/ServiceItemLines?${filter}` +
@@ -221,7 +204,7 @@ async function svMotorHandler(req, res) {
       itemsByDoc.get(k).push(it);
     }
 
-    // 3) ServiceOrderLines — join ด้วย Document_No
+    // 3) ServiceOrderLines — ดึงทุกหน้า, join ด้วย Document_No
     let orderLines = [];
     for (const chunk of chunks) {
       const filter = buildDocumentNoFilter(chunk);
@@ -241,7 +224,7 @@ async function svMotorHandler(req, res) {
       orderByDoc.get(k).push(ol);
     }
 
-    // 4) mapping ภายใน u_inspection + u_form
+    // 4) ดึง mapping ภายใน u_inspection + u_form
     const localRows = await new Promise((resolve, reject) => {
       db.query(
         `
@@ -259,22 +242,22 @@ async function svMotorHandler(req, res) {
       localBySv.set(r.sv, { type_form: r.type_form, form_name: r.form_name });
     }
 
-    // 5) 1 แถวต่อ SV (No)
-    const rows = headers.map(h => {
+    // 5) รวมผลลัพธ์ให้ 1 แถวต่อ SV (No)
+    const result = headers.map(h => {
       const sv = h.No;
 
       const itemArr = itemsByDoc.get(sv) || [];
       const orderArr = orderByDoc.get(sv) || [];
 
+      // เอาบรรทัดแรกเป็นตัวแทน (ปรับตามนโยบายได้ภายหลัง)
       const firstItem = itemArr[0] || {};
       const firstOrder = orderArr[0] || {};
 
+      // service item no: เอาจาก itemLines ก่อน ถ้าไม่มีค่อยใช้จาก orderLines
       const service_item_no =
         firstItem.Service_Item_No ||
         firstOrder.ServiceItemNo ||
         "";
-
-      const local = localBySv.get(sv) || {};
 
       return {
         // คีย์หลักและเมตต้า
@@ -282,32 +265,30 @@ async function svMotorHandler(req, res) {
         order_date: h.Order_Date || null,
         job_scope: h.USVT_Job_Scope ?? null,
 
-        // จาก ServiceOrderLines
+        // จาก ServiceOrderLines (ตาม field ที่มีจริง)
         ref_sales_quote_no: firstOrder.USVT_Ref_Sales_Quote_No ?? null,
         percent_complete: firstOrder.USVT_Percent_of_Completion ?? null,
 
-        // จาก ServiceItemLines
+        // จาก ServiceItemLines (ตาม field ที่มีจริง)
         service_item_no,
         item_description: firstItem.Description ?? null,
 
         // จากระบบภายใน
-        type_form: local.type_form ?? null,
-        form_name: local.form_name ?? null,
+        type_form: (localBySv.get(sv) || {}).type_form ?? null,
+        form_name: (localBySv.get(sv) || {}).form_name ?? null,
 
-        // แนบรายละเอียดบรรทัด
+        // แนบรายละเอียดบรรทัด (คงไว้ตามเดิม)
         service_item_lines: itemArr,
         service_order_lines: orderArr
       };
     });
 
-    // ส่งปีที่ใช้ไปด้วยเพื่อความชัดเจน
-    res.json({ selected_year: selectedYear, rows });
+    res.json(result);
   } catch (err) {
     console.error('SV MOTOR Error:', err?.response?.data || err?.message || err);
     res.status(500).json({ error: 'เกิดข้อผิดพลาดในการรวมข้อมูล motor' });
   }
 }
-
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Routes
