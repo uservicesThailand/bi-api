@@ -5,6 +5,7 @@ const cors = require('cors');
 const db = require('./db');
 const axios = require('axios');
 const dayjs = require('dayjs');
+const compression = require('compression');
 
 // ── bcAuth: รองรับทั้ง default และ named export ───────────────────────────
 const _bcAuth = require('./bcAuth');
@@ -21,6 +22,17 @@ const PORT = process.env.PORT || 5000;
 app.use(express.json());
 app.use(cors({ origin: '*', credentials: true }));
 
+// เปิด gzip/deflate/br ให้ทุก response ที่เหมาะสม
+app.use(compression({
+  // ตัวเลือกเสริม (ใช้ค่า default ก็ได้)
+  level: 6,                       // 0–9 (6 สมดุลดี)
+  threshold: 1024,                // บีบอัดเมื่อใหญ่กว่า 1KB
+  filter: (req, res) => {
+    // บีบอัดเฉพาะที่ client รับได้ และไม่ใช่ SSE เป็นต้น
+    if (req.headers['x-no-compress']) return false;
+    return compression.filter(req, res);
+  }
+}));
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers (ชุดเดียวพอ)
 function chunkArray(arr, size = 30) {
