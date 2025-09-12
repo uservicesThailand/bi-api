@@ -173,12 +173,15 @@ async function svMotorHandler(req, res) {
     const headerSelect = ['No', 'Order_Date', 'USVT_Job_Scope'].join(',');
     const headerFilter = `(Order_Date ge ${startISO} and Order_Date le ${endISO})`;
     const headerUrl =
-      `${base}/Service_Order_Excel?$select=${headerSelect}&$filter=${encodeURI(headerFilter)}&$top=500&$orderby=Order_Date desc`;
+      `${base}/Service_Order_Excel?$select=${headerSelect}&$filter=${encodeURI(headerFilter)}&$orderby=Order_Date desc`;
+    /*  const headerUrl =
+       `${base}/Service_Order_Excel?$select=${headerSelect}&$filter=${encodeURI(headerFilter)}&$top=100&$orderby=Order_Date desc`; */
 
     const headers = await fetchAllOData(headerUrl, {
       Authorization: `Bearer ${token}`,
       Accept: 'application/json'
     });
+
     if (!headers.length) return res.json([]);
 
     const svList = headers.map(h => h.No).filter(Boolean);
@@ -210,13 +213,14 @@ async function svMotorHandler(req, res) {
       const filter = buildDocumentNoFilter(chunk);
       const url =
         `${base}/ServiceOrderLines?${filter}` +
-        `&$select=Document_No,USVT_Ref_Sales_Quote_No,ServiceItemNo,USVT_Percent_of_Completion`;
+        `&$select=Document_No,USVT_Ref_Sales_Quote_No,ServiceItemNo,USVT_Percent_of_Completion,Repair_Status_Code`;
       const part = await fetchAllOData(url, {
         Authorization: `Bearer ${token}`,
         Accept: 'application/json'
       });
       orderLines = orderLines.concat(part);
     }
+
     const orderByDoc = new Map();
     for (const ol of orderLines) {
       const k = ol.Document_No;
@@ -228,9 +232,12 @@ async function svMotorHandler(req, res) {
     const localRows = await new Promise((resolve, reject) => {
       db.query(
         `
-        SELECT i.sv, i.type_form, f.form_name
+        SELECT i.sv, i.type_form, f.form_name, ie.elsv_1_1, i.mr_voltage, i.mr_power, i.power_unit,
+          p.rpdt_21housingde_1, p.rpdt_22housingnde_1, p.rpdt_23shaftbearde_1
         FROM u_inspection i
         LEFT JOIN u_form f ON i.type_form = f.id
+        LEFT JOIN u_inspection_elservice ie ON i.mt_id = ie.mt_id
+        LEFT JOIN u_partcheck p ON i.mt_id = p.mt_id
         WHERE YEAR(i.incoming_date) = ?
         `,
         [selectedYear],
@@ -238,9 +245,21 @@ async function svMotorHandler(req, res) {
       );
     });
     const localBySv = new Map();
+
     for (const r of localRows) {
-      localBySv.set(r.sv, { type_form: r.type_form, form_name: r.form_name });
+      localBySv.set(r.sv, {
+        type_form: r.type_form,
+        form_name: r.form_name,
+        elsv_1_1: r.elsv_1_1,
+        rpdt_21housingde_1: r.rpdt_21housingde_1,
+        rpdt_22housingnde_1: r.rpdt_22housingnde_1,
+        rpdt_23shaftbearde_1: r.rpdt_23shaftbearde_1,
+        mr_voltage: r.mr_voltage,
+        mr_power: r.mr_power,
+        power_unit: r.power_unit
+      });
     }
+
 
     // 5) รวมผลลัพธ์ให้ 1 แถวต่อ SV (No)
     const result = headers.map(h => {
@@ -268,14 +287,22 @@ async function svMotorHandler(req, res) {
         // จาก ServiceOrderLines (ตาม field ที่มีจริง)
         ref_sales_quote_no: firstOrder.USVT_Ref_Sales_Quote_No ?? null,
         percent_complete: firstOrder.USVT_Percent_of_Completion ?? null,
+        Repair_Status_Code: firstOrder.Repair_Status_Code ?? null,
 
         // จาก ServiceItemLines (ตาม field ที่มีจริง)
         service_item_no,
         item_description: firstItem.Description ?? null,
 
-        // จากระบบภายใน
+        // จากระบบภายใน (localRows)
         type_form: (localBySv.get(sv) || {}).type_form ?? null,
         form_name: (localBySv.get(sv) || {}).form_name ?? null,
+        elsv_1_1: (localBySv.get(sv) || {}).elsv_1_1 ?? null,
+        rpdt_21housingde_1: (localBySv.get(sv) || {}).rpdt_21housingde_1 ?? null,
+        rpdt_22housingnde_1: (localBySv.get(sv) || {}).rpdt_22housingnde_1 ?? null,
+        rpdt_23shaftbearde_1: (localBySv.get(sv) || {}).rpdt_23shaftbearde_1 ?? null,
+        mr_voltage: (localBySv.get(sv) || {}).mr_voltage ?? null,
+        mr_power: (localBySv.get(sv) || {}).mr_power ?? null,
+        power_unit: (localBySv.get(sv) || {}).power_unit ?? null,
 
         // แนบรายละเอียดบรรทัด (คงไว้ตามเดิม)
         service_item_lines: itemArr,
