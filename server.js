@@ -172,10 +172,10 @@ async function svMotorHandler(req, res) {
     // 1) หัวรายการจาก Service_Order_Excel (ใช้ No เป็นคีย์อ้างอิง, กรองปีด้วย Order_Date) — ดึงทุกหน้า
     const headerSelect = ['No', 'Order_Date', 'USVT_Job_Scope'].join(',');
     const headerFilter = `(Order_Date ge ${startISO} and Order_Date le ${endISO})`;
+    /* const headerUrl =
+      `${base}/Service_Order_Excel?$select=${headerSelect}&$filter=${encodeURI(headerFilter)}&$orderby=Order_Date desc`; */
     const headerUrl =
-      `${base}/Service_Order_Excel?$select=${headerSelect}&$filter=${encodeURI(headerFilter)}&$orderby=Order_Date desc`;
-    /*  const headerUrl =
-       `${base}/Service_Order_Excel?$select=${headerSelect}&$filter=${encodeURI(headerFilter)}&$top=100&$orderby=Order_Date desc`; */
+      `${base}/Service_Order_Excel?$select=${headerSelect}&$filter=${encodeURI(headerFilter)}&$top=100&$orderby=Order_Date desc`;
 
     const headers = await fetchAllOData(headerUrl, {
       Authorization: `Bearer ${token}`,
@@ -318,6 +318,188 @@ async function svMotorHandler(req, res) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// ─── helpers ────────────────────────────────────────────────────────────────
+function toIntStrict(val) {
+  const s = String(val ?? "").trim();
+  if (!s || s.toLowerCase() === "undefined" || s.toLowerCase() === "null") return NaN;
+  const n = Number.parseInt(s, 10);
+  return Number.isFinite(n) ? n : NaN;
+}
+function resolveYear(val) {
+  const n = toIntStrict(val);
+  const y = Number.isFinite(n) && n >= 2000 && n <= 2100 ? n : new Date().getUTCFullYear();
+  return y;
+}
+function resolveMonth(val) {
+  const n = toIntStrict(val);
+  return Number.isFinite(n) && n >= 1 && n <= 12 ? n : null; // null = ทั้งปี
+}
+function startEndDateOnly(year, month /* 1..12 or null */) {
+  const y = resolveYear(year);
+  if (!month) return { startDate: `${y}-01-01`, endDate: `${y}-12-31` };
+  const m = String(month).padStart(2, "0");
+  // วันสุดท้ายของเดือน (UTC safe)
+  const lastDay = new Date(Date.UTC(y, Number(m), 0 /* day 0 of next month */)).getUTCDate();
+  return { startDate: `${y}-${m}-01`, endDate: `${y}-${m}-${String(lastDay).padStart(2, "0")}` };
+}
+function safePage(val) { const n = toIntStrict(val); return Number.isFinite(n) && n >= 1 ? n : 1; }
+function safeLimit(val) { const n = toIntStrict(val); return Number.isFinite(n) ? Math.max(100, Math.min(2000, n)) : 1000; }
+
+// ─── handler (เฉพาะช่วงอ่าน query + ทำ URL) ───────────────────────────────
+app.get("/api/sv/motor-summary", async (req, res) => {
+  try {
+    const year = resolveYear(req.query.year);
+    const month = resolveMonth(req.query.month); // null = ทั้งปี
+    const page = safePage(req.query.page);
+    const limit = safeLimit(req.query.limit);
+    const skip = (page - 1) * limit;
+
+    // log ดีบัก — จะเห็นทันทีถ้า year กลายเป็น NaN ก่อนแก้
+    console.log("[sv/motor-summary] y=%s m=%s p=%s lim=%s", year, month ?? "-", page, limit);
+
+    const token = await getBcAccessToken();
+    const company = String(process.env.BC_COMPANY_NAME || "").replace(/'/g, "''");
+    const base =
+      `https://api.businesscentral.dynamics.com/v2.0/${process.env.BC_TENANT_ID}/${process.env.BC_ENVIRONMENT}` +
+      `/ODataV4/Company('${company}')`;
+
+    const { startDate, endDate } = startEndDateOnly(year, month);
+
+    // สำคัญ: Edm.Date → ใช้วันล้วน (ไม่ใส่ T, ไม่ใส่ datetimeoffset)
+    // ถ้า env งอแง ใช้รูปแบบ date'YYYY-MM-DD' ก็ได้ (ปลดคอมเมนต์แถวล่างแทน)
+    const headerSelect = ["No", "Order_Date", "USVT_Job_Scope"].join(",");
+    const headerFilterRaw = `(Order_Date ge ${startDate} and Order_Date le ${endDate})`;
+    // const headerFilterRaw = `(Order_Date ge date'${startDate}' and Order_Date le date'${endDate}')`;
+
+    console.log("[sv/motor-summary] filter=%s", headerFilterRaw);
+
+    const headerUrl =
+      `${base}/Service_Order_Excel?$select=${headerSelect}` +
+      `&$filter=${encodeURIComponent(headerFilterRaw)}` +
+      `&$orderby=Order_Date desc,No asc` +
+      `&$skip=${skip}&$top=${limit}`;
+
+    const headersResp = await axios.get(headerUrl, {
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' }
+    });
+    const headers = Array.isArray(headersResp.data?.value) ? headersResp.data.value : [];
+    if (!headers.length) return res.json([]); // หมดเพจแล้ว
+
+    // เตรียมรายการ SV ในเพจนี้เท่านั้น
+    const svList = headers.map(h => h.No).filter(Boolean);
+    const chunks = (arr, n) => {
+      const out = [];
+      for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+      return out;
+    };
+    const buildDocumentNoFilter = (arr) =>
+      `$filter=${arr.map(v => `Document_No eq '${String(v).replace(/'/g, "''")}'`).join(' or ')}`;
+
+    // ดึง ServiceItemLines เฉพาะ SV ในเพจนี้
+    let itemLines = [];
+    for (const chunk of chunks(svList, 30)) {
+      const url = `${base}/ServiceItemLines?${buildDocumentNoFilter(chunk)}&$select=Document_No,Service_Item_No,Description`;
+      const part = await axios.get(url, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } });
+      itemLines = itemLines.concat(part.data?.value || []);
+    }
+    const itemsByDoc = new Map();
+    for (const it of itemLines) {
+      const k = it.Document_No;
+      if (!itemsByDoc.has(k)) itemsByDoc.set(k, []);
+      itemsByDoc.get(k).push(it);
+    }
+
+    // ดึง ServiceOrderLines เฉพาะ SV ในเพจนี้
+    let orderLines = [];
+    for (const chunk of chunks(svList, 30)) {
+      const url = `${base}/ServiceOrderLines?${buildDocumentNoFilter(chunk)}&$select=Document_No,USVT_Ref_Sales_Quote_No,ServiceItemNo,USVT_Percent_of_Completion,Repair_Status_Code`;
+      const part = await axios.get(url, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } });
+      orderLines = orderLines.concat(part.data?.value || []);
+    }
+    const orderByDoc = new Map();
+    for (const ol of orderLines) {
+      const k = ol.Document_No;
+      if (!orderByDoc.has(k)) orderByDoc.set(k, []);
+      orderByDoc.get(k).push(ol);
+    }
+
+    // local DB: โหลดเฉพาะ sv ในเพจ (ไม่ใช้ทั้งปีเพื่อความเร็ว)
+    const bindSv = svList.map(_ => '?').join(',');
+    const localRows = await new Promise((resolve, reject) => {
+      if (!svList.length) return resolve([]);
+      db.query(
+        `
+          SELECT i.sv, i.type_form, f.form_name, ie.elsv_1_1, i.mr_voltage, i.mr_power, i.power_unit,
+                 p.rpdt_21housingde_1, p.rpdt_22housingnde_1, p.rpdt_23shaftbearde_1
+          FROM u_inspection i
+          LEFT JOIN u_form f ON i.type_form = f.id
+          LEFT JOIN u_inspection_elservice ie ON i.mt_id = ie.mt_id
+          LEFT JOIN u_partcheck p ON i.mt_id = p.mt_id
+          WHERE i.sv IN (${bindSv})
+        `,
+        svList,
+        (err, rows) => (err ? reject(err) : resolve(rows || []))
+      );
+    });
+    const localBySv = new Map();
+    for (const r of localRows) {
+      localBySv.set(r.sv, {
+        type_form: r.type_form,
+        form_name: r.form_name,
+        elsv_1_1: r.elsv_1_1,
+        rpdt_21housingde_1: r.rpdt_21housingde_1,
+        rpdt_22housingnde_1: r.rpdt_22housingnde_1,
+        rpdt_23shaftbearde_1: r.rpdt_23shaftbearde_1,
+        mr_voltage: r.mr_voltage,
+        mr_power: r.mr_power,
+        power_unit: r.power_unit,
+      });
+    }
+
+    // รวมผลลัพธ์แบบ "เส้นเดียว" (summary) — ไม่ส่ง arrays
+    const result = headers.map(h => {
+      const sv = h.No;
+      const itemArr = itemsByDoc.get(sv) || [];
+      const orderArr = orderByDoc.get(sv) || [];
+      const firstItem = itemArr[0] || {};
+      const firstOrder = orderArr[0] || {};
+      const service_item_no = firstItem.Service_Item_No || firstOrder.ServiceItemNo || '';
+      const local = localBySv.get(sv) || {};
+
+      return {
+        sv,
+        order_date: h.Order_Date || null,
+        job_scope: h.USVT_Job_Scope ?? null,
+
+        ref_sales_quote_no: firstOrder.USVT_Ref_Sales_Quote_No ?? null,
+        percent_complete: firstOrder.USVT_Percent_of_Completion ?? null, // ให้ฝั่ง M *100
+        Repair_Status_Code: firstOrder.Repair_Status_Code ?? null,
+
+        service_item_no,
+        item_description: firstItem.Description ?? null,
+
+        type_form: local.type_form ?? null,
+        form_name: local.form_name ?? null,
+        elsv_1_1: local.elsv_1_1 ?? null,
+        rpdt_21housingde_1: local.rpdt_21housingde_1 ?? null,
+        rpdt_22housingnde_1: local.rpdt_22housingnde_1 ?? null,
+        rpdt_23shaftbearde_1: local.rpdt_23shaftbearde_1 ?? null,
+        mr_voltage: local.mr_voltage ?? null,
+        mr_power: local.mr_power ?? null,
+        power_unit: local.power_unit ?? null,
+      };
+    });
+
+    // บอก client ว่าหน้านี้มีเท่าไร (optional)
+    res.setHeader('X-Page', String(page));
+    res.setHeader('X-Limit', String(limit));
+    res.json(result);
+  } catch (err) {
+    console.error('SV MOTOR SUMMARY Error:', err?.response?.data || err?.message || err);
+    res.status(500).json({ error: 'เกิดข้อผิดพลาดในการดึง motor-summary' });
+  }
+});
+
 // Routes
 app.get('/api/bc/data', bcDataHandler);
 app.post('/api/bc/data', bcDataHandler);
