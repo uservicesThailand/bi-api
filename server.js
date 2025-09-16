@@ -358,6 +358,7 @@ function safePage(val) { const n = toIntStrict(val); return Number.isFinite(n) &
 function safeLimit(val) { const n = toIntStrict(val); return Number.isFinite(n) ? Math.max(100, Math.min(2000, n)) : 1000; }
 
 // ─── handler (เฉพาะช่วงอ่าน query + ทำ URL) ───────────────────────────────
+// ─── handler (เฉพาะช่วงอ่าน query + ทำ URL) ───────────────────────────────
 app.get("/api/sv/motor-summary", async (req, res) => {
   try {
     const year = resolveYear(req.query.year);
@@ -366,8 +367,12 @@ app.get("/api/sv/motor-summary", async (req, res) => {
     const limit = safeLimit(req.query.limit);
     const skip = (page - 1) * limit;
 
-    // log ดีบัก — จะเห็นทันทีถ้า year กลายเป็น NaN ก่อนแก้
-    console.log("[sv/motor-summary] y=%s m=%s p=%s lim=%s", year, month ?? "-", page, limit);
+    // โหมดเร็ว (parallel + chunk ใหญ่) / โหมดเบา (ไม่ดึง lines)
+    const fast = String(req.query.fast || "").trim() === "1";
+    const lite = String(req.query.lite || "").trim() === "1"; // ยังใช้ได้เหมือนเดิม
+
+    console.log("[sv/motor-summary] y=%s m=%s p=%s lim=%s fast=%s lite=%s",
+      year, month ?? "-", page, limit, fast ? "on" : "off", lite ? "on" : "off");
 
     const token = await getBcAccessToken();
     const company = String(process.env.BC_COMPANY_NAME || "").replace(/'/g, "''");
@@ -378,13 +383,8 @@ app.get("/api/sv/motor-summary", async (req, res) => {
     const { startDate, endDate } = startEndDateOnly(year, month);
 
     // สำคัญ: Edm.Date → ใช้วันล้วน (ไม่ใส่ T, ไม่ใส่ datetimeoffset)
-    // ถ้า env งอแง ใช้รูปแบบ date'YYYY-MM-DD' ก็ได้ (ปลดคอมเมนต์แถวล่างแทน)
     const headerSelect = ["No", "Order_Date", "USVT_Job_Scope"].join(",");
     const headerFilterRaw = `(Order_Date ge ${startDate} and Order_Date le ${endDate})`;
-    // const headerFilterRaw = `(Order_Date ge date'${startDate}' and Order_Date le date'${endDate}')`;
-
-    console.log("[sv/motor-summary] filter=%s", headerFilterRaw);
-
     const headerUrl =
       `${base}/Service_Order_Excel?$select=${headerSelect}` +
       `&$filter=${encodeURIComponent(headerFilterRaw)}` +
@@ -392,50 +392,22 @@ app.get("/api/sv/motor-summary", async (req, res) => {
       `&$skip=${skip}&$top=${limit}`;
 
     const headersResp = await axios.get(headerUrl, {
-      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' }
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+      timeout: 120000 // กันเน็ตหน่วง
     });
     const headers = Array.isArray(headersResp.data?.value) ? headersResp.data.value : [];
-    if (!headers.length) return res.json([]); // หมดเพจแล้ว
+    if (!headers.length) {
+      res.setHeader('X-Page', String(page));
+      res.setHeader('X-Limit', String(limit));
+      res.setHeader('X-Fast', fast ? "1" : "0");
+      res.setHeader('X-Lite', lite ? "1" : "0");
+      return res.json([]);
+    }
 
-    // เตรียมรายการ SV ในเพจนี้เท่านั้น
+    // ลิสต์ SV ในเพจนี้
     const svList = headers.map(h => h.No).filter(Boolean);
-    const chunks = (arr, n) => {
-      const out = [];
-      for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
-      return out;
-    };
-    const buildDocumentNoFilter = (arr) =>
-      `$filter=${arr.map(v => `Document_No eq '${String(v).replace(/'/g, "''")}'`).join(' or ')}`;
 
-    // ดึง ServiceItemLines เฉพาะ SV ในเพจนี้
-    let itemLines = [];
-    for (const chunk of chunks(svList, 30)) {
-      const url = `${base}/ServiceItemLines?${buildDocumentNoFilter(chunk)}&$select=Document_No,Service_Item_No,Description`;
-      const part = await axios.get(url, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } });
-      itemLines = itemLines.concat(part.data?.value || []);
-    }
-    const itemsByDoc = new Map();
-    for (const it of itemLines) {
-      const k = it.Document_No;
-      if (!itemsByDoc.has(k)) itemsByDoc.set(k, []);
-      itemsByDoc.get(k).push(it);
-    }
-
-    // ดึง ServiceOrderLines เฉพาะ SV ในเพจนี้
-    let orderLines = [];
-    for (const chunk of chunks(svList, 30)) {
-      const url = `${base}/ServiceOrderLines?${buildDocumentNoFilter(chunk)}&$select=Document_No,USVT_Ref_Sales_Quote_No,ServiceItemNo,USVT_Percent_of_Completion,Repair_Status_Code`;
-      const part = await axios.get(url, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } });
-      orderLines = orderLines.concat(part.data?.value || []);
-    }
-    const orderByDoc = new Map();
-    for (const ol of orderLines) {
-      const k = ol.Document_No;
-      if (!orderByDoc.has(k)) orderByDoc.set(k, []);
-      orderByDoc.get(k).push(ol);
-    }
-
-    // local DB: โหลดเฉพาะ sv ในเพจ (ไม่ใช้ทั้งปีเพื่อความเร็ว)
+    // ── local DB (โหลดเฉพาะ sv ในเพจ) ─────────────────────────────────────
     const bindSv = svList.map(_ => '?').join(',');
     const localRows = await new Promise((resolve, reject) => {
       if (!svList.length) return resolve([]);
@@ -468,11 +440,67 @@ app.get("/api/sv/motor-summary", async (req, res) => {
       });
     }
 
-    // รวมผลลัพธ์แบบ "เส้นเดียว" (summary) — ไม่ส่ง arrays
+    // ── Lines: ทำเฉพาะถ้าไม่ใช่ lite ───────────────────────────────────────
+    let itemsByDoc = new Map();
+    let orderByDoc = new Map();
+
+    if (!lite) {
+      // ปรับขนาด chunk และยิงขนาน
+      const CHUNK = fast ? 120 : 30;
+
+      const chunks = (arr, n) => {
+        const out = [];
+        for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+        return out;
+      };
+      const buildDocumentNoFilter = (arr) =>
+        `$filter=${arr.map(v => `Document_No eq '${String(v).replace(/'/g, "''")}'`).join(' or ')}`;
+
+      const svChunks = chunks(svList, CHUNK);
+
+      // สร้าง promises ยิงขนานสำหรับ ItemLines และ OrderLines
+      const itemPromises = svChunks.map(chunk =>
+        axios.get(
+          `${base}/ServiceItemLines?${buildDocumentNoFilter(chunk)}&$select=Document_No,Service_Item_No,Description`,
+          { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' }, timeout: 120000 }
+        ).then(r => r.data?.value || [])
+      );
+
+      const orderPromises = svChunks.map(chunk =>
+        axios.get(
+          `${base}/ServiceOrderLines?${buildDocumentNoFilter(chunk)}&$select=Document_No,USVT_Ref_Sales_Quote_No,ServiceItemNo,USVT_Percent_of_Completion,Repair_Status_Code`,
+          { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' }, timeout: 120000 }
+        ).then(r => r.data?.value || [])
+      );
+
+      // ยิงขนานสองชุดพร้อมกัน
+      const [itemParts, orderParts] = await Promise.all([
+        Promise.all(itemPromises),
+        Promise.all(orderPromises),
+      ]);
+
+      // รวมผล
+      const itemLines = itemParts.flat();
+      const orderLines = orderParts.flat();
+
+      for (const it of itemLines) {
+        const k = it.Document_No;
+        if (!itemsByDoc.has(k)) itemsByDoc.set(k, []);
+        itemsByDoc.get(k).push(it);
+      }
+      for (const ol of orderLines) {
+        const k = ol.Document_No;
+        if (!orderByDoc.has(k)) orderByDoc.set(k, []);
+        orderByDoc.get(k).push(ol);
+      }
+    }
+
+    // ── รวมผลลัพธ์แบบ "เส้นเดียว" ────────────────────────────────────────
     const result = headers.map(h => {
       const sv = h.No;
       const itemArr = itemsByDoc.get(sv) || [];
       const orderArr = orderByDoc.get(sv) || [];
+
       const firstItem = itemArr[0] || {};
       const firstOrder = orderArr[0] || {};
       const service_item_no = firstItem.Service_Item_No || firstOrder.ServiceItemNo || '';
@@ -484,7 +512,7 @@ app.get("/api/sv/motor-summary", async (req, res) => {
         job_scope: h.USVT_Job_Scope ?? null,
 
         ref_sales_quote_no: firstOrder.USVT_Ref_Sales_Quote_No ?? null,
-        percent_complete: firstOrder.USVT_Percent_of_Completion ?? null, // ให้ฝั่ง M *100
+        percent_complete: firstOrder.USVT_Percent_of_Completion ?? null,
         Repair_Status_Code: firstOrder.Repair_Status_Code ?? null,
 
         service_item_no,
@@ -502,15 +530,19 @@ app.get("/api/sv/motor-summary", async (req, res) => {
       };
     });
 
-    // บอก client ว่าหน้านี้มีเท่าไร (optional)
     res.setHeader('X-Page', String(page));
     res.setHeader('X-Limit', String(limit));
+    res.setHeader('X-Fast', fast ? "1" : "0");
+    res.setHeader('X-Lite', lite ? "1" : "0");
     res.json(result);
   } catch (err) {
     console.error('SV MOTOR SUMMARY Error:', err?.response?.data || err?.message || err);
     res.status(500).json({ error: 'เกิดข้อผิดพลาดในการดึง motor-summary' });
   }
 });
+
+
+
 
 // Routes
 app.get('/api/bc/data', bcDataHandler);
