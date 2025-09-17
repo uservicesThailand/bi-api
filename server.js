@@ -358,7 +358,6 @@ function safePage(val) { const n = toIntStrict(val); return Number.isFinite(n) &
 function safeLimit(val) { const n = toIntStrict(val); return Number.isFinite(n) ? Math.max(100, Math.min(2000, n)) : 1000; }
 
 // ─── handler (เฉพาะช่วงอ่าน query + ทำ URL) ───────────────────────────────
-// ─── handler (เฉพาะช่วงอ่าน query + ทำ URL) ───────────────────────────────
 app.get("/api/sv/motor-summary", async (req, res) => {
   try {
     const year = resolveYear(req.query.year);
@@ -416,7 +415,7 @@ app.get("/api/sv/motor-summary", async (req, res) => {
           SELECT i.sv, i.type_form, f.form_name, ie.elsv_1_1, i.mr_voltage, i.mr_power, i.power_unit,
                  p.rpdt_21housingde_1, p.rpdt_22housingnde_1, p.rpdt_23shaftbearde_1
           FROM u_inspection i
-          LEFT JOIN u_form f ON i.type_form = f.id
+          LEFT JOIN u_form f ON i.type_form = f.form_type
           LEFT JOIN u_inspection_elservice ie ON i.mt_id = ie.mt_id
           LEFT JOIN u_partcheck p ON i.mt_id = p.mt_id
           WHERE i.sv IN (${bindSv})
