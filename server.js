@@ -540,8 +540,15 @@ app.get("/api/sv/motor-summary", async (req, res) => {
   }
 });
 
-
-
+// เพิ่มก่อน app.listen
+app.get('/', (req, res) => {
+  res.json({
+    status: 'ok',
+    message: 'Power BI API Server',
+    version: '1.0.0',
+    timestamp: new Date().toISOString()
+  });
+});
 
 // Routes
 app.get('/api/bc/data', bcDataHandler);
